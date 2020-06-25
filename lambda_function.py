@@ -4,11 +4,12 @@ import json
 import boto3
 import sys
 import uuid
+from datetime import datetime
 
 resource_bucket_name = 'case-study-resource' # replace with your resource bucket name
 pkg_name = 'pkg_tmp.tar.gz' # replace with your pkg_tmp file
 model_params = 'resnet50_v2.params' # replace with your model file
-output_table = 'case-study' # replace with your output_table name
+output_bucket = 'case-study-output' # replace with your output_bucket name
 lable_classes = 'synset.txt' # replace with your synset file name
 
 # Download package from s3 bucket
@@ -16,7 +17,7 @@ pkg_path = '/tmp/{}'.format(pkg_name)
 s3 = boto3.resource('s3')
 s3.Bucket(resource_bucket_name).download_file(pkg_name, pkg_path)
 
-
+# cache work directory
 work = os.getcwd()
 # change to /tmp to extract package
 os.chdir('/tmp')
@@ -35,13 +36,11 @@ from mxnet import nd
 from mxnet.gluon.model_zoo import vision as models
 
 # create model and load parameter
+params = '/tmp/{}'.format(model_params)
 net = models.resnet50_v2(pretrained=False)
-s3.Bucket(resource_bucket_name).download_file(model_params, '/tmp/{}'.format(model_params))
-net.load_parameters('/tmp/' + model_params, ctx=mx.cpu())
-
-
-db = boto3.resource('dynamodb')
-table = db.Table(output_table)
+s3.Bucket(resource_bucket_name).download_file(model_params, params)
+net.load_parameters(params, ctx=mx.cpu())
+net.hybridize()
 
 # generate lable_list
 with open(lable_classes, 'r') as f:
@@ -50,7 +49,7 @@ with open(lable_classes, 'r') as f:
 def lambda_handler(event, context):
     """
     Main entry point for AWS Lambda. It parse the input event, transform the image, 
-    make prediction and finally store the result into output_table.
+    make prediction and finally store the result into output_bucket.
     """
 
     def transform_image(img_path):
@@ -74,21 +73,20 @@ def lambda_handler(event, context):
         img_path = '/tmp/{}'.format(key)
         s3.Bucket(bucket).download_file(key, img_path)
     
-        # transform image and make inference
+        # transform image and perform inference
         data = transform_image(img_path)
         predict = net(data)
         idx = predict.topk(k=1)[0]
         idx = int(idx.asscalar())
         os.remove(img_path)
         
-        # send result into output table
-        table.put_item(
-            Item={
-                'UUID': str(uuid.uuid4()),
-                'ImageName': key,
-                'ObjectClass': labels[idx]
-            }
-        )
+        # create result file and send it to output bucket
+        # the title of the file contains the image file name and the time it was created
+        # the content of the file contains the predicted class.
+        time = datetime.now().strftime("%d%m%Y-%H:%M:%S")
+        file_name = '{}_{}.txt'.format(key, time)
+        content=labels[idx]
+        s3.Object(output_bucket, file_name).put(Body=content)
         
     
     return {
